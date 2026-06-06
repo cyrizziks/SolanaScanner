@@ -6,6 +6,7 @@
 const ALLOWED = new Set([
   "getAccountInfo",
   "getTokenLargestAccounts",
+  "getTokenAccounts",
   "getMultipleAccounts",
   "getSignaturesForAddress",
   "getTransaction",
