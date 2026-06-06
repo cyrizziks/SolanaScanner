@@ -69,7 +69,45 @@ const pct = (x) => (x == null ? "—" : x.toFixed(x < 1 ? 2 : 1) + "%");
 const daysAgo = (ts) => (ts ? Math.max(0, (Date.now() / 1000 - ts) / 86400) : null);
 
 /* ============================ ANALYSIS ENGINE ============================== */
-async function analyze(ca, endpoint, depth, onProgress) {
+/* Pull the true top-N holders. Helius getTokenAccounts (DAS) returns owner +
+   amount per token account; we paginate, aggregate by owner, and sort by
+   balance. Falls back to top-20 (getTokenLargestAccounts) if DAS is missing. */
+async function fetchTopHolders(rpc, ca, decimals, maxHolders, step) {
+  const byOwner = {};
+  const MAX_PAGES = 15; // ~15k accounts ceiling — plenty to find the real whales
+  let page = 1, pages = 0, truncated = false, total = 0;
+  try {
+    for (;;) {
+      const r = await rpc("getTokenAccounts", { mint: ca, page, limit: 1000, options: { showZeroBalance: false } });
+      const accts = r?.token_accounts || [];
+      accts.forEach((a) => {
+        const amt = Number(a.amount) / 10 ** decimals;
+        if (amt > 0) byOwner[a.owner] = (byOwner[a.owner] || 0) + amt;
+      });
+      pages++; total += accts.length;
+      if (accts.length < 1000) break;
+      if (pages >= MAX_PAGES) { truncated = true; break; }
+      page++;
+      step(`Fetching holders… ${total}+`);
+    }
+    const owners = Object.keys(byOwner);
+    if (!owners.length) throw new Error("empty");
+    const sorted = owners.map((o) => ({ owner: o, amount: byOwner[o] }))
+      .sort((a, b) => b.amount - a.amount).slice(0, maxHolders);
+    return { list: sorted, truncated, distinctOwners: owners.length };
+  } catch {
+    const largest = await rpc("getTokenLargestAccounts", [ca]);
+    const accts = (largest?.value || []).slice(0, 20);
+    const lookup = await rpc("getMultipleAccounts", [accts.map((t) => t.address), { encoding: "jsonParsed" }]);
+    const list = accts.map((t, i) => ({
+      owner: lookup?.value?.[i]?.data?.parsed?.info?.owner || t.address,
+      amount: Number(t.uiAmount) || 0,
+    }));
+    return { list, truncated: false, distinctOwners: list.length, fallback: true };
+  }
+}
+
+async function analyze(ca, endpoint, holdersN, traceDepth, onProgress) {
   const rpc = makeRpc(endpoint);
   const report = { ca, flags: [], warnings: [] };
   const step = (s) => onProgress && onProgress(s);
@@ -88,30 +126,27 @@ async function analyze(ca, endpoint, depth, onProgress) {
     freezeAuthority: info.freezeAuthority,    // null = renounced
   };
 
-  // 2) Top holders + %
+  // 2) True top-N holders (Helius DAS getTokenAccounts: paginate + aggregate)
   step("Fetching top holders…");
-  const largest = await rpc("getTokenLargestAccounts", [ca]);
-  const tokenAccts = (largest?.value || []).slice(0, 20);
-  const ownerLookup = await rpc("getMultipleAccounts", [
-    tokenAccts.map((t) => t.address),
-    { encoding: "jsonParsed" },
-  ]);
-  let holders = tokenAccts.map((t, i) => {
-    const owner = ownerLookup?.value?.[i]?.data?.parsed?.info?.owner || t.address;
-    const amount = Number(t.uiAmount) || 0;
-    const known = KNOWN[owner];
+  const { list, truncated, distinctOwners, fallback } =
+    await fetchTopHolders(rpc, ca, decimals, holdersN, step);
+  let holders = list.map((h) => {
+    const known = KNOWN[h.owner];
     return {
-      owner,
-      tokenAccount: t.address,
-      amount,
-      pctSupply: supply ? (amount / supply) * 100 : 0,
+      owner: h.owner,
+      amount: h.amount,
+      pctSupply: supply ? (h.amount / supply) * 100 : 0,
       known: known || null,
       isPool: known?.kind === "lp" || known?.kind === "burn",
     };
   });
+  report.holderCount = distinctOwners;
+  report.truncated = truncated;
+  if (fallback) report.warnings.push("getTokenAccounts unavailable on this RPC — showing top 20 only. Needs a Helius endpoint.");
+  if (truncated) report.warnings.push(`Token has many holders — ranked the largest ~15k accounts. Deep tail not counted.`);
 
-  // 3) Per-wallet deep read (age + funding source) for top `depth` real holders
-  const targets = holders.filter((h) => !h.isPool).slice(0, depth);
+  // 3) Per-wallet deep read (age + funding) for the top `traceDepth` real holders
+  const targets = holders.filter((h) => !h.isPool).slice(0, traceDepth);
   step(`Tracing ${targets.length} wallets (age + funding)…`);
   await pool(targets, 3, async (h) => {
     const sigs = await rpc("getSignaturesForAddress", [h.owner, { limit: 1000 }]);
@@ -279,7 +314,8 @@ const SEV = {
 };
 
 export default function App() {
-  const [depth, setDepth] = useState(15);
+  const [holdersN, setHoldersN] = useState(100);
+  const [depth, setDepth] = useState(25);
   const [ca, setCa] = useState("");
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState("");
@@ -294,12 +330,12 @@ export default function App() {
     if (!addr) return;
     setLoading(true); setErr(""); setReport(null); setProgress("Starting…");
     try {
-      const r = await analyze(addr, RPC_PROXY, depth, setProgress);
+      const r = await analyze(addr, RPC_PROXY, holdersN, depth, setProgress);
       setReport(r);
     } catch (e) {
       setErr(e.message || String(e));
     } finally { setLoading(false); }
-  }, [ca, depth]);
+  }, [ca, holdersN, depth]);
 
   const copy = (txt) => { navigator.clipboard?.writeText(txt); setCopied(txt); setTimeout(() => setCopied(""), 1200); };
 
@@ -343,10 +379,13 @@ export default function App() {
         {showCfg && (
           <div style={{ borderTop: "1px solid #1b1d22", background: "#0d0f12" }}>
             <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 20px", display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
-              <label style={{ fontSize: 11, color: "#6b6f78" }}>DEPTH (top holders to deep-trace)</label>
-              <input type="number" min={5} max={20} value={depth} onChange={(e) => setDepth(Math.max(5, Math.min(20, +e.target.value || 15)))}
-                style={{ width: 70, background: "#0a0b0d", border: "1px solid #2a2d34", color: "#e7e3d8", borderRadius: 8, padding: "9px 12px", fontSize: 12 }} />
-              <span style={{ fontSize: 11, color: "#4a4d54" }}>RPC runs through your Netlify function — key stays server-side.</span>
+              <label style={{ fontSize: 11, color: "#6b6f78" }}>HOLDERS (list size)</label>
+              <input type="number" min={20} max={200} value={holdersN} onChange={(e) => setHoldersN(Math.max(20, Math.min(200, +e.target.value || 100)))}
+                style={{ width: 76, background: "#0a0b0d", border: "1px solid #2a2d34", color: "#e7e3d8", borderRadius: 8, padding: "9px 12px", fontSize: 12 }} />
+              <label style={{ fontSize: 11, color: "#6b6f78" }}>TRACE (deep age+funding)</label>
+              <input type="number" min={5} max={50} value={depth} onChange={(e) => setDepth(Math.max(5, Math.min(50, +e.target.value || 25)))}
+                style={{ width: 76, background: "#0a0b0d", border: "1px solid #2a2d34", color: "#e7e3d8", borderRadius: 8, padding: "9px 12px", fontSize: 12 }} />
+              <span style={{ fontSize: 11, color: "#4a4d54" }}>Higher TRACE = deeper clustering but more Helius credits/scan.</span>
             </div>
           </div>
         )}
@@ -431,6 +470,7 @@ function Report({ r, onWallet, copy, copied }) {
             <Stat label="TOP-1" value={pct(r.metrics.top1)} />
             <Stat label="TOP-10" value={pct(r.metrics.top10)} />
             <Stat label="FRESH" value={r.metrics.freshCount} />
+            <Stat label="HOLDERS" value={Intl.NumberFormat("en", { notation: "compact" }).format(r.holderCount || r.holders.length) + (r.truncated ? "+" : "")} />
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
             <Authority ok={!r.token.mintAuthority} on={<><Unlock size={13} /> Mint live</>} off={<><Lock size={13} /> Mint renounced</>} />
@@ -463,6 +503,12 @@ function Report({ r, onWallet, copy, copied }) {
               </span>
             );
           })}
+        </div>
+      )}
+
+      {r.warnings?.length > 0 && (
+        <div style={{ marginBottom: 14, fontSize: 11, color: "#6b6f78", lineHeight: 1.6 }}>
+          {r.warnings.map((w, i) => <div key={i}>· {w}</div>)}
         </div>
       )}
 
@@ -530,7 +576,7 @@ function Report({ r, onWallet, copy, copied }) {
 function ClusterGraph({ r, onWallet }) {
   const ref = useRef(null);
   const nodes = useMemo(() => {
-    const real = r.holders.filter((h) => !h.isPool).slice(0, 16);
+    const real = r.holders.filter((h) => !h.isPool && h.ageDays != null).slice(0, 40);
     return real.map((h) => ({ id: h.owner, r: 6 + Math.sqrt(h.pctSupply) * 4, h, group: h.funder || h.owner }));
   }, [r]);
   const links = useMemo(() => {
