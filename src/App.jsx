@@ -1156,6 +1156,9 @@ function Drawer({ h, onClose, copy, copied, onUpdate, onInspect }) {
             </div>
           )}
         </div>
+
+        {/* your intel — manual tags, flags & notes */}
+        <div style={{ marginTop: 12, padding: 14, background: "#0a0b0d", border: "1px solid #1b1d22", borderRadius: 10 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <Sparkles size={14} color="#d4ff47" />
             <span className="display" style={{ fontWeight: 600, fontSize: 13 }}>Your intel</span>
